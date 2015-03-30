@@ -1,2 +1,10 @@
-all:
-	gcc -std=c99 -g -o perfmon perfmon.c
+
+CC=gcc
+CFLAGS=-std=c99
+
+all: perfmon monitor
+
+perfmon: perfmon.o
+
+monitor: monitor.o
+
