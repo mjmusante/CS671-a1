@@ -92,9 +92,10 @@ main(int argc, char *argv[])
 	}
 
 	if (argc > 3) {
+		/* third argument is the output filename */
 		path = argv[3];
 	} else {
-		/* third argument is the output filename */
+		/* construct a default filename */
 		strftime(pathname, MAX_LENGTH, DEFAULT_OUTPUT_TEMPLATE,
 		    localtime(&start_time));
 		path = pathname;
