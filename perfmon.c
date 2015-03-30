@@ -1,3 +1,8 @@
+/*
+ * Author: Mark Musante
+ * Class: BU MET CS671, Spring 2015
+ */
+
 #include <stdio.h>
 #include <sys/types.h>
 #include <dirent.h>
