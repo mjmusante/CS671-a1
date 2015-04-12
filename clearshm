@@ -1,0 +1,15 @@
+#! /bin/bash
+
+GREP=/usr/bin/grep
+IPCS=/usr/bin/ipcs
+
+if [ -z "$1" ]; then
+	echo "Specify part of the shm key to grep for"
+	exit 1
+fi
+
+$IPCS -m | $GREP '^0x' | $GREP $1 | while read key stuff
+do
+	echo ipcrm -M $key
+	ipcrm -M $key
+done
