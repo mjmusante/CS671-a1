@@ -3,6 +3,8 @@
  * Class: BU MET CS671, Spring 2015
  */
 
+#define	_SVID_SOURCE
+
 #include <stdio.h>
 #include <sys/types.h>
 #include <dirent.h>
@@ -10,6 +12,10 @@
 #include <sys/param.h>
 #include <unistd.h>
 #include <string.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#include "procdata.h"
 
 /*
  * Global: number of clock ticks per second
@@ -20,30 +26,6 @@ static long Clock_Tick;
  * Global: size in bytes for a memory page
  */
 static long Page_Size;
-
-/*
- * Struct: per-process data
- */
-typedef struct procdata_s {
-	pid_t pid;			// process pid
-	pid_t ppid;			// parent process pid
-	pid_t pgrp;			// process group
-	unsigned long long starttime;	// start time (tv_sec)
-	double utime;			// user-time in seconds
-	double stime;			// system-time in seconds
-	unsigned long long rss;		// rss size in bytes
-	unsigned long long text;	// text size in bytes
-	unsigned long long data;	// data size in bytes
-	unsigned long long shared;	// shared size in bytes
-	unsigned long long library;	// library size in bytes
-	unsigned long majflt;		// major page faults
-	unsigned long minflt;		// minor page faults
-	uid_t ruid;			// real user id
-	uid_t euid;			// effective user id
-	gid_t rgid;			// real group id
-	gid_t egid;			// effective group id
-	char *command;			// full command
-} procdata_t;
 
 /*
  * Forward declarations for reading each type of data
@@ -73,9 +55,10 @@ struct procreader_s {
  * The full data for all processes are stored here in procinfo_t
  */
 typedef struct procinfo_s {
-	int count;
-	int alloc;
-	procdata_t *pd;
+	int count;			/* number of pids found */
+	int alloc;			/* memory allocated */
+	int strsize;			/* amount of string space needed */
+	procdata_t *pd;			/* pointer to the array */
 } procinfo_t;
 
 /*
@@ -303,6 +286,7 @@ get_procs(void)
 	 */
 	pi->count = 0;
 	pi->alloc = 10;
+	pi->strsize = 0;
 	pi->pd = malloc(pi->alloc * sizeof (procdata_t));
 
 	if (dir == NULL) {
@@ -351,6 +335,9 @@ get_procs(void)
 			reader[i].get(fp, pd);
 			fclose(fp);
 		}
+
+		/* accumulate the string size */
+		pi->strsize += strlen(pd->command) + 1;
 	}
 
 	/* we're done - close the directory */
@@ -361,22 +348,76 @@ get_procs(void)
 }
 
 /*
- * Usage:
- * 	perfmon
- * 	
- * Command line arguments:
- * 	- none -
+ * Function:	write_to_stdout
+ * Description:	write process data to standard output
+ * Input:	proc = a pointer to the procinfo_t containing process data
+ * 		keyfile = a pathname to the file to turn into a key
+ * 		id = shared memory id to use
+ * Returns:	void
  */
-int
-main(int argc, char *argv[])
+static void
+write_to_shm(procinfo_t *proc, char *keyfile, int id)
 {
-	/* set the globals */
-	Clock_Tick = sysconf(_SC_CLK_TCK);
-	Page_Size = sysconf(_SC_PAGE_SIZE);
+	key_t shmkey;
+	int shmid;
+	int datasize = proc->count * sizeof (procdata_t);
+	int shmsize = 8 + proc->strsize + datasize;
+	void *addr;
 
-	/* get all process information */
-	procinfo_t *proc = get_procs();
+	if ((shmkey = ftok(keyfile, id)) == (key_t)-1) {
+		perror("could not generate shm key");
+		exit(1);
+	}
 
+	if ((shmid = shmget(shmkey, shmsize, IPC_CREAT | 0666)) == -1) {
+		perror("could not allocate shared memory");
+		exit(1);
+	}
+
+	if ((addr = shmat(shmid, NULL, 0)) == (void *)-1) {
+		perror("could not attach to shared memory");
+		exit(1);
+	}
+
+	/*
+	 * Now we write to the shared memory segment. We'll make one
+	 * change to the struct: the "command" pointer will be an
+	 * offset from the beginning of the shared memory region, instead
+	 * of the actual address of the command string.
+	 */
+
+	/* we skip the first 8 bytes: that will hold the count */
+	char *strptr = ((char *)addr) + 8 + datasize;
+	procdata_t *shm_pd = addr + 8;
+
+	/* save the number of entries */
+	*((int*)addr) = proc->count;
+
+	for (int i = 0; i < proc->count; i++, shm_pd++) {
+		procdata_t *pd = &proc->pd[i];
+
+		/* copy the struct data */
+		memcpy(shm_pd, pd, sizeof (procdata_t));
+
+		if (pd->pid > 0) {
+			/* set the offset for the command string and copy it */
+			shm_pd->command = (char *)(strptr - (char *)addr);
+			strcpy(strptr, pd->command);
+			strptr += strlen(pd->command) + 1;
+			free(pd->command);
+		}
+	}
+}
+
+/*
+ * Function:	write_to_stdout
+ * Description:	write process data to standard output
+ * Input:	proc = a pointer to the procinfo_t containing process data
+ * Returns:	void
+ */
+static void
+write_to_stdout(procinfo_t *proc)
+{
 	/* print it out in a comma-separated list */
 	for (int i = 0; i < proc->count; i++) {
 		procdata_t *pd = &proc->pd[i];
@@ -402,11 +443,37 @@ main(int argc, char *argv[])
 		printf("%s\n", pd->command);
 		free(pd->command);	// free each command as we come to it
 	}
+}
+
+/*
+ * Usage:
+ * 	perfmon
+ * 	
+ * Command line arguments:
+ * 	- none -
+ */
+int
+main(int argc, char *argv[])
+{
+	/* set the globals */
+	Clock_Tick = sysconf(_SC_CLK_TCK);
+	Page_Size = sysconf(_SC_PAGE_SIZE);
+
+	/* get all process information */
+	procinfo_t *proc = get_procs();
+
+	/*
+	 * If there's a command line argument, then we'll use that for
+	 * the shared memory key. Write the data into that segment.
+	 */
+	if (argc > 1)
+		write_to_shm(proc, argv[1], atoi(argv[2]));
+	else
+		write_to_stdout(proc);
 
 	/* free our allocations */
 	free(proc->pd);
 	free(proc);
 
-	/* success */
 	return (0);
 }

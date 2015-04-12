@@ -16,27 +16,177 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
-#define	NUM_COLLECTIONS 15
-#define	INTERVAL 5
+#include "procdata.h"
 
-static void *
-get_shm_addr(char *name, int id)
+#define	NUM_COLLECTIONS 5
+#define	INTERVAL 1
+
+typedef struct summary {
+	double start_utime;
+	double end_utime;
+	double start_stime;
+	double end_stime;
+	unsigned long long total_rss;
+	unsigned long long total_data;
+	unsigned long long total_shared;
+	unsigned long long total_library;
+	unsigned long total_majflt;
+	unsigned long total_minflt;
+	unsigned int count;
+} summary_t;
+
+typedef struct shm_data {
+	void *addr;
+	int shmid;
+	int cur;
+	int done;
+} shm_data_t;
+
+#define	CURADDR(data) (&(((procdata_t *)(((char *)data.addr) + 8)) \
+				[data.cur]))
+
+static void
+get_shm_addr(char *name, int id, shm_data_t *data)
 {
 	key_t shmkey;
-	int shmid;
-	void *addr;
 
-	if ((shmkey = ftok(name, id)) = (key_t)-1) {
+	if ((shmkey = ftok(name, id)) == (key_t)-1) {
 		perror("could not generate shm key");
 		exit(1);
 	}
 
-	if ((shmid = shmget(shmkey, 0, 0666)) == -1) {
+	if ((data->shmid = shmget(shmkey, 0, 0666)) == -1) {
 		perror("could not get shmid");
 		exit(1);
 	}
 
-	return (shmat(shmid, NULL, 0));
+	if ((data->addr = shmat(data->shmid, NULL, 0)) == (void *)-1) {
+		perror("could not get shmaddr");
+		exit(1);
+	}
+}
+
+static void
+init_lowest(shm_data_t *data)
+{
+	procdata_t *pd = (procdata_t *)(((char *)data->addr) + 8);
+	int max = *(int *)data->addr;
+	
+	for (int i = 0; i < max; i++) {
+		if (pd[i].pid != 0) {
+			data->cur = i;
+			data->done = 0;
+			return;
+		}
+	}
+	data->done = 1;
+}
+
+/*
+ * The following fields are summarised:
+ * utime	- time: end - start
+ * stime	- time: end - start
+ * rss		- average: sum / count
+ * data		- average: sum / count
+ * shared	- average: sum / count
+ * library	- average: sum / count
+ * majflt	- average: sum / count
+ * minflt	- average: sum / count
+ *
+ * The following fields are left out of the summary as they do not
+ * vary over the course of the execution:
+ *	pid, ppid, pgrp, [re][gu]id
+ */
+static void
+do_summary(summary_t *sum, procdata_t *pd)
+{
+	if (sum->start_utime == 0)
+		sum->start_utime = pd->utime;
+	else
+		sum->end_utime = pd->utime;
+
+	if (sum->start_stime == 0)
+		sum->start_stime = pd->stime;
+	else
+		sum->end_stime = pd->stime;
+
+	sum->total_rss += pd->rss;
+	sum->total_data += pd->data;
+	sum->total_shared += pd->shared;
+	sum->total_library += pd->library;
+	sum->total_majflt += pd->majflt;
+	sum->total_minflt += pd->minflt;
+
+	sum->count++;
+}
+
+static int
+scan_one(shm_data_t *shmdata)
+{
+	int found = 0;
+	int lowest;
+	summary_t sum;
+
+	for (int i = 1; i < NUM_COLLECTIONS; i++) {
+		if (shmdata[i].done)
+			continue;
+
+		procdata_t *pd = CURADDR(shmdata[i]);
+
+		if (!found && pd->pid > 0) {
+			lowest = pd->pid;
+			found = 1;
+		} else if (pd->pid > 0 && pd->pid < lowest) {
+			lowest = pd->pid;
+		}
+	}
+
+	if (!found)
+		return (0);
+
+	memset(&sum, 0, sizeof (summary_t));
+
+	for (int i = 0; i < NUM_COLLECTIONS; i++) {
+		procdata_t *pd = CURADDR(shmdata[i]);
+		int max = *(int *)shmdata[i].addr;
+
+		if (pd->pid != lowest)
+			continue;
+
+		do_summary(&sum, pd);
+
+		++shmdata[i].cur;
+		if (shmdata[i].cur >= max)
+			shmdata[i].done = 1;
+		while (!shmdata[i].done) {
+			pd = CURADDR(shmdata[i]);
+			if (pd->pid == 0) {
+				++shmdata[i].cur;
+				if (shmdata[i].cur >= max)
+					shmdata[i].done = 1;
+			} else {
+				break;
+			}
+		}
+	}
+	
+	printf("%d, %f, %f, %llu, %llu, %llu, %llu, %lu, %lu\n",
+	    lowest, sum.end_utime - sum.start_utime,
+	    sum.end_stime - sum.start_stime,
+	    sum.total_rss / sum.count,
+	    sum.total_data / sum.count,
+	    sum.total_shared / sum.count,
+	    sum.total_library / sum.count,
+	    sum.total_majflt / sum.count,
+	    sum.total_minflt / sum.count);
+	
+	return (1);
+}	
+
+static void
+scan_data(shm_data_t *shmdata)
+{
+	while (scan_one(shmdata));
 }
 
 int
@@ -44,7 +194,7 @@ main(int argc, char *argv[])
 {
 	key_t shmkey;
 	int shmid, fd;
-	void *addr[NUM_COLLECTIONS];
+	shm_data_t shmdata[NUM_COLLECTIONS];
 	char *temp = tempnam("/tmp", ".collector");
 
 	if (temp == NULL) {
@@ -61,11 +211,17 @@ main(int argc, char *argv[])
 		char syscmd[1024];
 
 		sprintf(syscmd, "./perfmon %s %d", temp, i + 1);
-		printf("> %s\n", syscmd);
+		fprintf(stderr, "> %s\n", syscmd);
 		system(syscmd);
-		addr[i] = get_shm_addr(temp, i + 1);
+		get_shm_addr(temp, i + 1, &shmdata[i]);
+		init_lowest(&shmdata[i]);
 		sleep(INTERVAL);
 	}
+
+	scan_data(shmdata);
+
+	for (int i = 0; i < NUM_COLLECTIONS; i++)
+		shmctl(shmdata[i].shmid, IPC_RMID, NULL);
 
 	return (0);
 }
