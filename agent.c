@@ -20,7 +20,7 @@
 
 
 #define	NUM_COLLECTIONS 15		// how many times we should collect
-#define	INTERVAL 1			// time (seconds) between collections
+#define	INTERVAL 60			// time (seconds) between collections
 
 /*
  * This structure contains the summary data for a single pid across
@@ -128,12 +128,12 @@ static void
 do_summary(summary_t *sum, procdata_t *pd)
 {
 	if (sum->start_utime == 0)
-		sum->start_utime = pd->utime;
+		sum->start_utime = sum->end_utime = pd->utime;
 	else
 		sum->end_utime = pd->utime;
 
 	if (sum->start_stime == 0)
-		sum->start_stime = pd->stime;
+		sum->start_stime = sum->end_stime = pd->stime;
 	else
 		sum->end_stime = pd->stime;
 
