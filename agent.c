@@ -18,9 +18,15 @@
 
 #include "procdata.h"
 
-#define	NUM_COLLECTIONS 5
-#define	INTERVAL 1
 
+#define	NUM_COLLECTIONS 15		// how many times we should collect
+#define	INTERVAL 1			// time (seconds) between collections
+
+/*
+ * This structure contains the summary data for a single pid across
+ * all collections. This is generated once per pid found in the shared
+ * memory.
+ */
 typedef struct summary {
 	double start_utime;
 	double end_utime;
@@ -35,6 +41,9 @@ typedef struct summary {
 	unsigned int count;
 } summary_t;
 
+/*
+ * Each collection gets its own shm_data struct.
+ */
 typedef struct shm_data {
 	void *addr;
 	int shmid;
@@ -42,9 +51,21 @@ typedef struct shm_data {
 	int done;
 } shm_data_t;
 
+/*
+ * This macro gives us a pointer to the start of the procdata_t structure
+ * that the ".cur" value points to.
+ */
 #define	CURADDR(data) (&(((procdata_t *)(((char *)data.addr) + 8)) \
 				[data.cur]))
 
+/*
+ * Function:	get_shm_addr
+ * Description:	set the shmid and the addr values for the shared memory
+ * Input:	name = filename for ftok
+ * 		id = id for ftok
+ * 		data = pointer to shm data to fill in
+ * Returns:	void
+ */
 static void
 get_shm_addr(char *name, int id, shm_data_t *data)
 {
@@ -66,6 +87,12 @@ get_shm_addr(char *name, int id, shm_data_t *data)
 	}
 }
 
+/*
+ * Function:	init_lowest
+ * Description:	Find the lowest pid in a given shared memory region
+ * Input:	data = pointer to the shared memory data
+ * Returns:	void
+ */
 static void
 init_lowest(shm_data_t *data)
 {
@@ -120,6 +147,12 @@ do_summary(summary_t *sum, procdata_t *pd)
 	sum->count++;
 }
 
+/*
+ * Function:	scan_one
+ * Description:	Scan the lowest pid, and create a summary of the data
+ * Input:	shmdata = pointer to the shared memory data
+ * Returns:	0 if there are no more pids to scan, 1 if there are
+ */
 static int
 scan_one(shm_data_t *shmdata)
 {
@@ -183,12 +216,6 @@ scan_one(shm_data_t *shmdata)
 	return (1);
 }	
 
-static void
-scan_data(shm_data_t *shmdata)
-{
-	while (scan_one(shmdata));
-}
-
 int
 main(int argc, char *argv[])
 {
@@ -218,7 +245,7 @@ main(int argc, char *argv[])
 		sleep(INTERVAL);
 	}
 
-	scan_data(shmdata);
+	while(scan_one(shmdata));
 
 	for (int i = 0; i < NUM_COLLECTIONS; i++)
 		shmctl(shmdata[i].shmid, IPC_RMID, NULL);
