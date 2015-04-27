@@ -15,12 +15,15 @@
 #include <string.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 #include "procdata.h"
 
 
-#define	NUM_COLLECTIONS 5		// how many times we should collect
+#define	NUM_COLLECTIONS 15		// how many times we should collect
 #define	INTERVAL 2			// time (seconds) between collections
+#define	SERVER_PORT	5678		// port to bind to
 
 /*
  * This structure contains the summary data for a single pid across
@@ -151,18 +154,23 @@ do_summary(summary_t *sum, procdata_t *pd)
  * Function:	scan_one
  * Description:	Scan the lowest pid, and create a summary of the data
  * Input:	shmdata = pointer to the shared memory data
+ * 		fd = file descriptor to write to
  * Returns:	0 if there are no more pids to scan, 1 if there are
  */
 static int
-scan_one(shm_data_t *shmdata)
+scan_one(shm_data_t *shmdata, int fd, int start)
 {
 	int found = 0;
-	int lowest;
+	int lowest, len, i;
 	summary_t sum;
+	char buf[4096];
 
-	for (int i = 0; i < NUM_COLLECTIONS; i++) {
-		if (shmdata[i].done)
+	i = start;
+	do {
+		if (shmdata[i].done) {
+			i = (i + 1) % NUM_COLLECTIONS;
 			continue;
+		}
 
 		procdata_t *pd = CURADDR(shmdata[i]);
 
@@ -172,19 +180,30 @@ scan_one(shm_data_t *shmdata)
 		} else if (pd->pid > 0 && pd->pid < lowest) {
 			lowest = pd->pid;
 		}
-	}
+		i = (i + 1) % NUM_COLLECTIONS;
+	} while (i != start);
 
-	if (!found)
+	if (!found) {
+		/*
+		 * No more pids were found. Clear out the 'done' values
+		 * and return 0.
+		 */
+		for (int i = 0; i < NUM_COLLECTIONS; i++)
+			shmdata[i].done = 0;
 		return (0);
+	}
 
 	memset(&sum, 0, sizeof (summary_t));
 
-	for (int i = 0; i < NUM_COLLECTIONS; i++) {
+	i = start;
+	do {
 		procdata_t *pd = CURADDR(shmdata[i]);
 		int max = *(int *)shmdata[i].addr;
 
-		if (pd->pid != lowest)
+		if (pd->pid != lowest) {
+			i = (i + 1) % NUM_COLLECTIONS;
 			continue;
+		}
 
 		do_summary(&sum, pd);
 
@@ -201,9 +220,10 @@ scan_one(shm_data_t *shmdata)
 				break;
 			}
 		}
-	}
+		i = (i + 1) % NUM_COLLECTIONS;
+	} while (i != start);
 	
-	printf("%d, %f, %f, %llu, %llu, %llu, %llu, %lu, %lu\n",
+	len = sprintf(buf, "%d, %f, %f, %llu, %llu, %llu, %llu, %lu, %lu\n",
 	    lowest, sum.end_utime - sum.start_utime,
 	    sum.end_stime - sum.start_stime,
 	    sum.total_rss / sum.count,
@@ -212,17 +232,107 @@ scan_one(shm_data_t *shmdata)
 	    sum.total_library / sum.count,
 	    sum.total_majflt / sum.count,
 	    sum.total_minflt / sum.count);
-	
+	write(fd, buf, len);
 	return (1);
 }	
+
+/*
+ * Function:	open_port
+ * Description:	Create a port and listen on it
+ * Returns:	file descriptor of socket. Exits on error.
+ */
+int
+open_port()
+{
+	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+	int on = 1;
+	struct sockaddr_in addr = { 0 };
+
+	if (fd < 0) {
+		perror("socket");
+		exit(1);
+	}
+
+	if (setsockopt(fd, 0, SO_REUSEADDR, &on, sizeof (int)) < 0) {
+		perror("setsockopt SO_REUSEADDR");
+		exit(1);
+	}
+
+	addr.sin_port = htons(SERVER_PORT);
+	addr.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(fd, (struct sockaddr *)&addr, sizeof (addr)) < 0) {
+		perror("bind");
+		exit(1);
+	}
+
+	(void) listen(fd, 10);
+	return (fd);
+}
+
+/*
+ * Function:	serve_up
+ * Description:	Serve data up to a client
+ * Input:	shmdata = pointer to shared memory data
+ * 		fd = file descriptor to write to
+ * 		ready = is the 15-minute scan ready yet
+ */
+void
+serve_up(shm_data_t *shmdata, int fd, int ready, int start)
+{
+	uint32_t len;
+
+	/* first four bytes is the message length, in network order */
+	if (read(fd, &len, sizeof (len)) < 0) {
+		perror("read");
+		return;
+	}
+
+	/* read the command */
+	char *command = malloc(len);
+	if (read(fd, command, len) < 0) {
+		perror("socket read");
+		return;
+	}
+
+	if (*command == '1') {
+		/*
+		 * If the summary data is ready, then return it. If not,
+		 * then just return an error message.
+		 */
+		if (ready)
+			while (scan_one(shmdata, fd, start));
+		else
+			write(fd, "not ready yet", 13);
+	} else if (*command == '2') {
+		pid_t pid = fork();
+
+		/*
+		 * Snapshot data: just kick off an instance of 'perfmon'.
+		 */
+		if (pid == 0) {
+			if (dup2(fd, 1) < 0) {
+				perror("dup2");
+				exit(1);
+			}
+			execl("perfmon", "perfmon", 0);
+			exit(1);
+		} else if (pid < 0) {
+			perror("fork");
+			return;
+		}
+	} else {
+		write(fd, "*error*", 7);
+	}
+}
 
 int
 main(int argc, char *argv[])
 {
-	key_t shmkey;
-	int shmid, fd;
-	shm_data_t shmdata[NUM_COLLECTIONS];
+	int shmid, fd, socfd, cur = 0;
+	shm_data_t shmdata[NUM_COLLECTIONS] = { 0 };
 	char *temp = tempnam("/tmp", ".collector");
+	int ready = 0;
 
 	if (temp == NULL) {
 		perror("could not generate temp file name");
@@ -234,21 +344,35 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
-	for (int i = 0; i < NUM_COLLECTIONS; i++) {
-		char syscmd[1024];
+	socfd = open_port();
 
-		sprintf(syscmd, "./perfmon %s %d", temp, i + 1);
-		fprintf(stderr, "> %s\n", syscmd);
+	/* Loop until killed */
+	for (;;) {
+		char syscmd[1024];
+		union {
+			struct sockaddr addr;
+			char buf[512];
+		} accbuf;
+		int clientfd;
+		socklen_t len;
+
+		if (shmdata[cur].shmid != 0)
+			shmctl(shmdata[cur].shmid, IPC_RMID, NULL);
+		sprintf(syscmd, "./perfmon %s %d", temp, cur + 1);
+		printf(">> %s\n", syscmd);
 		system(syscmd);
-		get_shm_addr(temp, i + 1, &shmdata[i]);
-		init_lowest(&shmdata[i]);
+		get_shm_addr(temp, cur + 1, &shmdata[cur]);
+		init_lowest(&shmdata[cur]);
+		cur = (cur + 1) % NUM_COLLECTIONS;
+		if (cur == 0)
+			ready = 1;
+
+		clientfd = accept(socfd, &accbuf.addr, &len);
+		if (clientfd >= 0) {
+			serve_up(shmdata, clientfd, ready, cur);
+			close(clientfd);
+		}
+
 		sleep(INTERVAL);
 	}
-
-	while(scan_one(shmdata));
-
-	for (int i = 0; i < NUM_COLLECTIONS; i++)
-		shmctl(shmdata[i].shmid, IPC_RMID, NULL);
-
-	return (0);
 }
